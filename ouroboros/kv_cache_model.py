@@ -24,8 +24,8 @@ class KVCacheModelLade():
         self.ctx = None
 
     @torch.no_grad()
-    def generate(self, input : torch.Tensor, ngram_cache, gamma : int) -> torch.Tensor:
-        output = self._model.lade_generate(inputs=input, max_new_tokens=gamma, continue_ctx=self.ctx, continue_flag=(self.ctx != None), do_sample=False, window_size = self.window_size, guess_set_size = self.guess_set_size, lookahead_level = self.lookahead_level, ngram_cache = ngram_cache)
+    def generate(self, input : torch.Tensor, ngram_cache, gamma : int, do_sample = False) -> torch.Tensor:
+        output = self._model.lade_generate(inputs=input, max_new_tokens=gamma, continue_ctx=self.ctx, continue_flag=(self.ctx != None), do_sample=do_sample, window_size = self.window_size, guess_set_size = self.guess_set_size, lookahead_level = self.lookahead_level, ngram_cache = ngram_cache, tempture = 0.8 )
         self.ctx = self._model.ctx
 
         lst_token = int(output[0, -1])
@@ -40,10 +40,11 @@ class KVCacheModelLade():
     
     @torch.no_grad()
     def rollback(self, end_pos : int):
-        for i in range(32):
+        for i in range(len(self.ctx['past_key_values'])):
             k = self.ctx['past_key_values'][i][0][:,:,:end_pos,:]
             v = self.ctx['past_key_values'][i][1][:,:,:end_pos,:]
             self.ctx['past_key_values'][i] = (k, v)
+        self.ctx["past_logits"] = self.ctx["past_logits"][:,:end_pos,:]
     
     def update_ngram_cache(self, remaining_approx_tok: torch.tensor, remaining_target_tok: torch.tensor):
         assert remaining_approx_tok.shape[-1] == remaining_target_tok.shape[-1]

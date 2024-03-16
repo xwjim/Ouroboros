@@ -1,14 +1,104 @@
 import torch
 from tqdm import tqdm
-import torch
-
+import torch, random
+from typing import List, Tuple
 from .kv_cache_model import KVCacheModelLade, KVCacheModelSimpleWithGuess
 from ouroboros.cache_engine import CacheEngine
 
 
 @torch.no_grad()
+def evaluate_posterior(
+        target_logits: torch.Tensor, 
+        candidates: torch.Tensor,
+        candidate_tree_index: torch.Tensor,
+        draft_logits: torch.Tensor = None,
+        do_sample: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Evaluate the posterior probabilities of the candidates based on the provided logits and choose the best candidate.
+
+    Depending on the temperature value, the function either uses greedy decoding or evaluates posterior
+    probabilities to select the best candidate.
+
+    Args:
+    - draft_logits (torch.Tensor): Predicted logits of shape (batch_size, sequence_length, vocab_size).
+    - target_logits (torch.Tensor): Predicted logits of shape (batch_size, sequence_length, vocab_size).
+    - candidate_tree_index: the position index according to the candidate (batch_size, branch_max, length_max).
+    - candidates (torch.Tensor): Candidate token sequences  (batch_size, branch_max, length_max).
+    - logits_processor : Softmax temperature for probability scaling. A value of None indicates greedy decoding.
+
+    Returns:
+    - best_candidate (torch.Tensor): Index of the chosen best candidate (batch_size).
+    - accept_length (torch.Tensor): Length of the accepted candidate sequence (batch_size).
+    """
+    # Greedy decoding based on temperature value
+    candidate_logits = torch.gather(target_logits.unsqueeze(1), 2, candidate_tree_index.expand(-1,-1,-1,target_logits.shape[-1]))
+    if not do_sample:
+        
+        posterior_mask = (
+                candidates.to(target_logits.device) == torch.argmax(candidate_logits, dim=-1)
+        ).int()
+        candidates_accept_length = (torch.cumprod(posterior_mask, dim=-1)).sum(dim=-1)
+        accept_length = candidates_accept_length.max(dim=1).values
+        # Choose the best candidate
+        best_candidate = torch.argmax(candidates_accept_length,dim=1).to(torch.long)
+        # Default to the first candidate if none are accepted
+        best_candidate.masked_fill_(accept_length == 0 ,0)
+            
+        return best_candidate, accept_length
+    else:
+        candidate_draft_logits = torch.gather(draft_logits.unsqueeze(1), 2, candidate_tree_index.expand(-1,-1,-1,target_logits.shape[-1]))
+
+        N_batch = target_logits.shape[0]
+        best_candidate = torch.zeros((N_batch), dtype=torch.long)
+        accept_length = torch.zeros((N_batch), dtype=torch.long)
+        for bt in range(N_batch):
+
+            accept_candidate = None
+            ac_length = 0
+            ac_index = 0
+
+            for step in range(candidates.shape[-1]):
+            
+                if step != ac_length:
+                    break
+
+                if step == 0:
+                    is_eq = torch.ones((candidates.shape[1]) ,dtype=torch.long)
+                else:
+                    is_eq = (candidates[bt, :, :ac_length] == accept_candidate).all(dim=1)
+
+                fi = torch.nonzero(is_eq, as_tuple=True)[0].tolist()
+                tar_pro = torch.softmax(candidate_logits[bt],dim=-1)
+                draft_pro = torch.softmax(candidate_draft_logits[bt],dim=-1)
+
+                for candidate_index in fi:
+                    # from IPython import embed; embed() 
+                    r = random.random()
+                    verify_token = candidates[bt,candidate_index,step]
+                    acp = tar_pro[candidate_index, step, verify_token]/draft_pro[candidate_index, step, verify_token]
+                    # print("step:{:d}. random seed:{:.3f}. acp pro:{:.3f}. verify pro:{:.3f}".format(step,r,acp,tar_pro[candidate_index, step, verify_token]))
+                    if r <= acp:
+                        ac_length += 1
+                        ac_index = candidate_index
+                        accept_candidate = torch.cat((accept_candidate,verify_token.reshape(1)),dim=0) if accept_candidate is not None else verify_token.reshape(1)
+                        break
+                    else:
+                        tar_pro = tar_pro - draft_pro
+                        tar_pro[tar_pro<0] = 0
+                        tar_pro = tar_pro/tar_pro.sum()
+
+            best_candidate[bt] = ac_index
+            accept_length[bt] = ac_length
+
+        return best_candidate, accept_length
+
+
+                # for token_set in fi:
+
+@torch.no_grad()
 def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, ngram_cache : CacheEngine = None,
-                         max_len : int = 512 , gamma : int = 4, window_size = 20, guess_set_size = 20, lookahead_level = 7, eos_token_id = 2, topk = 3) -> torch.Tensor:
+                         max_len : int = 512 , gamma : int = 4, window_size = 20, guess_set_size = 20, lookahead_level = 7, eos_token_id = 2, topk = 3, do_sample = False) -> torch.Tensor:
     """
     Performs ouroboros with an approximate model and a target model to generate a sequence of tokens.
 
@@ -57,7 +147,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         prefix_len = prefix.shape[1]
 
 
-        x, out_len, guess = approx_model_cache.generate(prefix, ngram_cache, gamma)
+        x, out_len, guess = approx_model_cache.generate(prefix, ngram_cache, gamma, do_sample = do_sample)
         target_model_cache._forward_with_kvcache(x, guess)
 
         key_tok = int(x[:,-1])
@@ -67,26 +157,23 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         n = prefix_len + gen_len - 1
 
         # print(prefix)
-        
+        # assert (torch.argmax(approx_model_cache.ctx["past_logits"][:, prefix_len-1:prefix_len-1+gen_len, :],dim=-1) == x[:, prefix_len:prefix_len+gen_len]).all()
+        # print(target_model_cache._prob_history.device,approx_model_cache.ctx["past_logits"].device,device)
+        best_candidate, accept_length = evaluate_posterior(
+            target_logits = target_model_cache._prob_history[:, prefix_len-1:, :].to(device),
+            candidates = x[:, prefix_len:prefix_len+gen_len].unsqueeze(1),
+            candidate_tree_index = torch.arange(gen_len)[None,None,:,None].to(device),
+            draft_logits = approx_model_cache.ctx["past_logits"][:, prefix_len-1:prefix_len-1+gen_len, :],
+            do_sample = do_sample,
+        )
 
-        for i in range(gen_len):
-            j = x[:, prefix_len + i]
-            
-            t_tok = target_model_cache._prob_history[:, prefix_len + i - 1, :].argmax(dim=-1, keepdim=True).to(j.device)
-            if t_tok != j:
-                remaining_target_tok = target_model_cache._prob_history[:, prefix_len + i: out_len, :].argmax(dim=-1) 
-                remaining_approx_tok = x[:, prefix_len + i:]
-                # from IPython import embed; embed()
-                approx_model_cache.update_ngram_cache(remaining_approx_tok, remaining_target_tok) # TODO
-                # reject
-                n = prefix_len + i - 1
-                break
-            if j == eos_token_id:
-                end_pos = prefix_len + i + 1
-            accepted_count += 1
-        
-        # print(f"n : {n}, i : {i}, prefix_len + gamma - 1: {prefix_len + gamma - 1}")
-        assert n >= prefix_len - 1, f"n {n}, prefix_len {prefix_len}"
+        accept_length = accept_length.item()
+        accepted_count += accept_length
+        n = prefix_len + accept_length - 1
+
+        if accept_length != 0 and x[:,prefix_len+accept_length-1] == eos_token_id:
+            end_pos = prefix_len + accept_length
+
         prefix = x[:, :n + 1]
 
         approx_model_cache.rollback(n+1)
