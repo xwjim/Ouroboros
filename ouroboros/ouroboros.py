@@ -98,7 +98,8 @@ def evaluate_posterior(
 
 @torch.no_grad()
 def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, ngram_cache : CacheEngine = None,
-                         max_len : int = 512 , gamma : int = 4, window_size = 20, guess_set_size = 20, lookahead_level = 7, eos_token_id = 2, topk = 3, do_sample = False) -> torch.Tensor:
+                        max_len : int = 512 , gamma : int = 4, window_size = 20, guess_set_size = 20, lookahead_level = 7,
+                        eos_token_id = 2, topk = 30, top_p = 0.9, do_sample = False, temperature=1) -> torch.Tensor:
     """
     Performs ouroboros with an approximate model and a target model to generate a sequence of tokens.
 
@@ -131,7 +132,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
 
     guess_size = lookahead_level - 1
     
-    approx_model_cache = KVCacheModelLade(approx_model, window_size=window_size, guess_set_size=guess_set_size, lookahead_level=lookahead_level, topk=topk)
+    approx_model_cache = KVCacheModelLade(approx_model, window_size=window_size, guess_set_size=guess_set_size, lookahead_level=lookahead_level)
     target_model_cache = KVCacheModelSimpleWithGuess(target_model, lookahead_level=lookahead_level)
 
     # target_model_cache = KVCacheModelSimple(target_model)
@@ -146,8 +147,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         # q = M_q[prefix + x_0, x_1, .., x_(gamma-2)]
         prefix_len = prefix.shape[1]
 
-
-        x, out_len, guess = approx_model_cache.generate(prefix, ngram_cache, gamma, do_sample = do_sample)
+        x, out_len, guess = approx_model_cache.generate(prefix, ngram_cache, gamma, do_sample = do_sample, temperature=temperature, top_k=topk, top_p=top_p)
         target_model_cache._forward_with_kvcache(x, guess)
 
         key_tok = int(x[:,-1])

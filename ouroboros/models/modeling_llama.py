@@ -2930,6 +2930,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 **model_kwargs,
             )
         else:
+
+            logits_warper = self._get_logits_warper(generation_config)
+
+
             return self.jacobi_sample_multilevel(
                 input_ids=input_ids,
                 logits_processor=prepared_logits_processor,
@@ -2944,6 +2948,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 guess_set_size = guess_set_size,
                 lookahead_level = lookahead_level,
                 ngram_cache=ngram_cache,
+                logits_warper=logits_warper,
                 *args,
                 **model_kwargs,
             )
