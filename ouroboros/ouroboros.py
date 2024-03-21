@@ -163,7 +163,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
             target_logits = target_model_cache._prob_history[:, prefix_len-1:, :].to(device),
             candidates = x[:, prefix_len:prefix_len+gen_len].unsqueeze(1),
             candidate_tree_index = torch.arange(gen_len)[None,None,:,None].to(device),
-            draft_logits = approx_model_cache.ctx["past_logits"][:, prefix_len-1:prefix_len-1+gen_len, :],
+            draft_logits = approx_model_cache.ctx["past_logits"][:, prefix_len-1:prefix_len-1+gen_len, :].to(device),
             do_sample = do_sample,
         )
 

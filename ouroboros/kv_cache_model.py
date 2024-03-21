@@ -24,8 +24,8 @@ class KVCacheModelLade():
         self.ctx = None
 
     @torch.no_grad()
-    def generate(self, input : torch.Tensor, ngram_cache, gamma : int, do_sample = False) -> torch.Tensor:
-        output = self._model.lade_generate(inputs=input, max_new_tokens=gamma, continue_ctx=self.ctx, continue_flag=(self.ctx != None), do_sample=do_sample, window_size = self.window_size, guess_set_size = self.guess_set_size, lookahead_level = self.lookahead_level, ngram_cache = ngram_cache, tempture = 0.8 )
+    def generate(self, input : torch.Tensor, ngram_cache, gamma : int, **kwargs ) -> torch.Tensor:
+        output = self._model.lade_generate(inputs=input, max_new_tokens=gamma, continue_ctx=self.ctx, continue_flag=(self.ctx != None), window_size = self.window_size, guess_set_size = self.guess_set_size, lookahead_level = self.lookahead_level, ngram_cache = ngram_cache, **kwargs)
         self.ctx = self._model.ctx
 
         lst_token = int(output[0, -1])
