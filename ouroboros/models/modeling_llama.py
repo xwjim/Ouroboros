@@ -46,17 +46,42 @@ from transformers.generation.configuration_utils import GenerationConfig
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList, GreedySearchOutput, SampleOutput, TemperatureLogitsWarper, TopPLogitsWarper, TopKLogitsWarper
 import torch.distributed as dist
-
+from transformers.utils import is_flash_attn_2_available
 import copy, inspect
 import warnings
 
 from ouroboros.cache_engine import CacheEngine
 
-FUNC_MAP = {}
 CONFIG_MAP = {}
 COLOR_PRINT = int(os.environ.get("COLOR_PRINT", 0))
 
-if is_flash_attn_available():
+def config_lade(WINDOW_SIZE=None, LEVEL=None, DEBUG=None, GUESS_SET_SIZE=None, ALWAYS_FWD_ONE=None, SPLIT_FLAG=None, DIST_WORKERS=None, POOL_FROM_PROMPT=None, backend = 'nccl', USE_FLASH=None):
+    if WINDOW_SIZE is not None:
+        CONFIG_MAP["WINDOW_SIZE"] = WINDOW_SIZE
+    if LEVEL is not None:
+        CONFIG_MAP["LEVEL"] = LEVEL
+    if GUESS_SET_SIZE is not None:
+        CONFIG_MAP["GUESS_SET_SIZE"] = GUESS_SET_SIZE
+    if ALWAYS_FWD_ONE is not None:
+        CONFIG_MAP["ALWAYS_FWD_ONE"] = ALWAYS_FWD_ONE
+    if DEBUG is not None:
+        CONFIG_MAP["DEBUG"] = DEBUG
+    if SPLIT_FLAG is not None:
+        CONFIG_MAP["SPLIT_FLAG"] = SPLIT_FLAG
+    if POOL_FROM_PROMPT is not None:
+        CONFIG_MAP["POOL_FROM_PROMPT"] = POOL_FROM_PROMPT
+    if DIST_WORKERS is not None and DIST_WORKERS > 1:
+        CONFIG_MAP["DIST_WORKERS"] = DIST_WORKERS
+        CONFIG_MAP["LOCAL_RANK"] = int(os.environ["LOCAL_RANK"])
+        dist.init_process_group(backend, rank=CONFIG_MAP["LOCAL_RANK"])
+        torch.cuda.set_device(CONFIG_MAP["LOCAL_RANK"])
+        assert dist.get_world_size() == DIST_WORKERS, "DIST_WORKERS config should be equal to work size"
+    if USE_FLASH is not None:
+        CONFIG_MAP["USE_FLASH"] = USE_FLASH
+
+    CONFIG_MAP["log"] = []
+    
+if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
@@ -1656,7 +1681,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        
+        if use_flash:
+            assert flash_attn_lookahead_available
+            swap_axis_for_flash = use_flash  and past_tokens[1] is not None
+        else:
+            swap_axis_for_flash = False 
 
         #assert attention_mask.all().item(), " Mask Must All Be One "
         assert labels is None, " Inference Mode "
@@ -2043,9 +2072,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             past_tokens = continue_ctx['past_tokens']
             # past_tokens = [[set_token() for _ in range(WINDOW_SIZE + LEVEL - 3)]] + [None for _ in range(LEVEL - 2)]
             fill_level = continue_ctx['fill_level'] 
-            # token_map = continue_ctx['token_map']
             ngram_cache = continue_ctx['ngram_cache']
-            # token_map = {}
             lst_token = int(input_ids[:,-1])
         else:
             ngram_cache = ngram_cache
@@ -3076,30 +3103,6 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             attentions=transformer_outputs.attentions,
         )
 
-def append_new_generated_pool(tokens, token_map, LEVEL, GUESS_SET_SIZE):
-    if len(tokens) != LEVEL:
-        return 
-    lst_token = tokens[0]
-    tup = tuple(tokens[1:])
-
-    if GUESS_SET_SIZE != -1: #limited guess set size for each key, lru policy  
-        if lst_token not in token_map:
-            token_map[lst_token] = []
-        if tup in token_map[lst_token]:
-            token_map[lst_token].remove(tup)
-            token_map[lst_token].append(tup)
-        elif len(token_map[lst_token]) < GUESS_SET_SIZE:
-            token_map[lst_token].append(tup) 
-        else:
-            assert len(token_map[lst_token]) == GUESS_SET_SIZE
-            token_map[lst_token] = token_map[lst_token][1:] + [tup]
-    else: #unlimited guess set size for each key 
-        #first add 
-        if lst_token not in token_map:
-            token_map[lst_token] = set()
-        token_map[lst_token].add(tup)
-
-
 def filter_window(level_window, eos_token_id, reset_func):
     
     for idx in range(len(level_window)):
@@ -3149,6 +3152,30 @@ def update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WIND
                 token_map[past_tokens[0][i - 1]] = set()
             tup = tuple(past_tokens[ll][i] for ll in range(1, LEVEL - 1)) + (new_results[i],)
             token_map[past_tokens[0][i - 1]].add(tup)
+
+
+def append_new_generated_pool(tokens, token_map, LEVEL, GUESS_SET_SIZE):
+    if len(tokens) != LEVEL:
+        return 
+    lst_token = tokens[0]
+    tup = tuple(tokens[1:])
+
+    if GUESS_SET_SIZE != -1: #limited guess set size for each key, lru policy  
+        if lst_token not in token_map:
+            token_map[lst_token] = []
+        if tup in token_map[lst_token]:
+            token_map[lst_token].remove(tup)
+            token_map[lst_token].append(tup)
+        elif len(token_map[lst_token]) < GUESS_SET_SIZE:
+            token_map[lst_token].append(tup) 
+        else:
+            assert len(token_map[lst_token]) == GUESS_SET_SIZE
+            token_map[lst_token] = token_map[lst_token][1:] + [tup]
+    else: #unlimited guess set size for each key 
+        #first add 
+        if lst_token not in token_map:
+            token_map[lst_token] = set()
+        token_map[lst_token].add(tup) 
 
 
 def fill_pool_with_prompt(prompts, token_map, LEVEL, GUESS_SET_SIZE):

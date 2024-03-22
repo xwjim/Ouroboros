@@ -1,10 +1,10 @@
 import torch
 from tqdm import tqdm
-import torch, random
+import torch, random, time
 from typing import List, Tuple
 from .kv_cache_model import KVCacheModelLade, KVCacheModelSimpleWithGuess
 from ouroboros.cache_engine import CacheEngine
-
+from ouroboros.models.modeling_llama import  config_lade
 
 @torch.no_grad()
 def evaluate_posterior(
@@ -33,6 +33,8 @@ def evaluate_posterior(
     """
     # Greedy decoding based on temperature value
     candidate_logits = torch.gather(target_logits.unsqueeze(1), 2, candidate_tree_index.expand(-1,-1,-1,target_logits.shape[-1]))
+    N_batch = candidate_logits.shape[0]
+    next_new_token_prob = torch.zeros((N_batch,candidate_logits.shape[-1]), dtype=candidate_logits.dtype)
     if not do_sample:
         
         posterior_mask = (
@@ -44,14 +46,18 @@ def evaluate_posterior(
         best_candidate = torch.argmax(candidates_accept_length,dim=1).to(torch.long)
         # Default to the first candidate if none are accepted
         best_candidate.masked_fill_(accept_length == 0 ,0)
+
+        for bt in range(accept_length.shape[0]):
+            if accept_length[bt] < candidate_logits.shape[2]:
+                next_new_token_prob[bt] = torch.argmax(candidate_logits[bt,best_candidate[bt],accept_length[bt]], dim=-1)
             
-        return best_candidate, accept_length
+        return best_candidate, accept_length, next_new_token_prob
     else:
         candidate_draft_logits = torch.gather(draft_logits.unsqueeze(1), 2, candidate_tree_index.expand(-1,-1,-1,target_logits.shape[-1]))
 
-        N_batch = target_logits.shape[0]
         best_candidate = torch.zeros((N_batch), dtype=torch.long)
         accept_length = torch.zeros((N_batch), dtype=torch.long)
+        
         for bt in range(N_batch):
 
             accept_candidate = None
@@ -90,8 +96,9 @@ def evaluate_posterior(
 
             best_candidate[bt] = ac_index
             accept_length[bt] = ac_length
-
-        return best_candidate, accept_length
+            if ac_length < candidate_logits.shape[2]:
+                next_new_token_prob[bt] = tar_pro[ac_index,ac_length]
+        return best_candidate, accept_length, next_new_token_prob
 
 
                 # for token_set in fi:
@@ -99,7 +106,7 @@ def evaluate_posterior(
 @torch.no_grad()
 def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, ngram_cache : CacheEngine = None,
                         max_len : int = 512 , gamma : int = 4, window_size = 20, guess_set_size = 20, lookahead_level = 7,
-                        eos_token_id = 2, topk = 30, top_p = 0.9, do_sample = False, temperature=1) -> torch.Tensor:
+                        eos_token_id = 2, topk = 30, top_p = 0.9, do_sample = True, temperature=1) -> torch.Tensor:
     """
     Performs ouroboros with an approximate model and a target model to generate a sequence of tokens.
 
@@ -123,6 +130,11 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         ngram_cache = CacheEngine(lookahead_level, guess_set_size)
     seq_len = prefix.shape[1]
     T = seq_len + max_len
+
+    if do_sample:
+        import os
+        config_lade(LEVEL=lookahead_level, WINDOW_SIZE=window_size, GUESS_SET_SIZE=guess_set_size, POOL_FROM_PROMPT=False, DIST_WORKERS=len(os.environ.get("CUDA_VISIBLE_DEVICES").split(",")))
+        # lade.config_lade(LEVEL=args.level, WINDOW_SIZE=args.window, GUESS_SET_SIZE=args.guess, DEBUG=1, USE_FLASH=args.use_flash, )
     
     assert prefix.shape[0] == 1, "input batch size must be 1"
 
@@ -159,7 +171,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         # print(prefix)
         # assert (torch.argmax(approx_model_cache.ctx["past_logits"][:, prefix_len-1:prefix_len-1+gen_len, :],dim=-1) == x[:, prefix_len:prefix_len+gen_len]).all()
         # print(target_model_cache._prob_history.device,approx_model_cache.ctx["past_logits"].device,device)
-        best_candidate, accept_length = evaluate_posterior(
+        best_candidate, accept_length, next_new_token_prob = evaluate_posterior(
             target_logits = target_model_cache._prob_history[:, prefix_len-1:, :].to(device),
             candidates = x[:, prefix_len:prefix_len+gen_len].unsqueeze(1),
             candidate_tree_index = torch.arange(gen_len)[None,None,:,None].to(device),
@@ -181,7 +193,10 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         corr_ngram = [] # ngram corrected by target_model
 
         if n < prefix_len + gen_len - 1:
-            t = target_model_cache._prob_history[:, n, :].argmax(dim=-1, keepdim=True)
+            if do_sample:
+                t = torch.multinomial(next_new_token_prob[0], 1)[None,:]
+            else:
+                t = target_model_cache._prob_history[:, n, :].argmax(dim=-1, keepdim=True)
             if t == eos_token_id:
                 end_pos = n + 2
 
