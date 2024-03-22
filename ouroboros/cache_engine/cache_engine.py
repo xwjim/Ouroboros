@@ -1,8 +1,8 @@
 import torch
 
 class CacheEngine():
-    def __init__(self, LEVEL, GUESS_SET_SIZE):
-        self.token_map = {}
+    def __init__(self, LEVEL, GUESS_SET_SIZE, token_map={}):
+        self.token_map = token_map
         self.level = LEVEL
         self.guess_set_size = GUESS_SET_SIZE
 

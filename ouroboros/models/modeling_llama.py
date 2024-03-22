@@ -80,7 +80,7 @@ def config_lade(WINDOW_SIZE=None, LEVEL=None, DEBUG=None, GUESS_SET_SIZE=None, A
         CONFIG_MAP["USE_FLASH"] = USE_FLASH
 
     CONFIG_MAP["log"] = []
-    
+
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
@@ -2073,6 +2073,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             # past_tokens = [[set_token() for _ in range(WINDOW_SIZE + LEVEL - 3)]] + [None for _ in range(LEVEL - 2)]
             fill_level = continue_ctx['fill_level'] 
             ngram_cache = continue_ctx['ngram_cache']
+            token_map = ngram_cache.token_map
             lst_token = int(input_ids[:,-1])
         else:
             ngram_cache = ngram_cache
@@ -2206,6 +2207,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                             if sample_prob < prob_accept:
                                 #accept
                                 hits.append(draft_guess)
+                                next_tokens = torch.tensor(draft_guess,dtype=torch.long,device=guess_probs.device)
                                 is_accept = True 
                                 max_hit_idx = guess_idx
                                 new_guess_indices = []
@@ -2227,9 +2229,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                             probs_next = guess_probs[guess_offset + idx_in_ngram]
                             continue 
                         else:
-                            new_token_gen = torch.multinomial(probs_next, num_samples=1).item()
+                            next_tokens = torch.multinomial(probs_next, num_samples=1)
                             #print("non accept: ", probs_next.size(), new_token_gen)
-                            hits.append(new_token_gen)
+                            hits.append(next_tokens)
                             break
 
                     #hits.append(new_token_gen)
@@ -2333,8 +2335,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             continue_ctx["past_logits"] =  past_logits
             continue_ctx['fill_level'] = fill_level
             continue_ctx['cur_input_ids'] = input_ids
-            # continue_ctx['token_map'] = token_map
-            continue_ctx['ngram_cache'] = ngram_cache
+            continue_ctx['ngram_cache'] = CacheEngine(LEVEL,GUESS_SET_SIZE,token_map=token_map)
             self.ctx = continue_ctx
 
             ###not change codes below
