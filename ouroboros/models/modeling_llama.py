@@ -2054,12 +2054,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         ###############end Init methods
         fill_level = 0
         guess_tokens = None
-        token_map = {}
         steps = 0
         guess_skip_dist = 0
-
-        if POOL_FROM_PROMPT:
-            fill_pool_with_prompt(all_old_tokens, token_map, LEVEL, GUESS_SET_SIZE)
 
         if chat:
             init = self.tokenizer.decode(all_old_tokens, skip_special_tokens=True, \
@@ -2076,6 +2072,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             token_map = ngram_cache.token_map
             lst_token = int(input_ids[:,-1])
         else:
+            token_map = {}
+            if POOL_FROM_PROMPT:
+                fill_pool_with_prompt(all_old_tokens, token_map, LEVEL, GUESS_SET_SIZE)
             ngram_cache = ngram_cache
             past_logits = None
 

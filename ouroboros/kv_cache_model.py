@@ -1,6 +1,6 @@
 import torch
 from typing import Optional
-
+from ouroboros.models.modeling_llama import  config_lade
 
 def _debug_show_kvcache(past_key_values):
     if  past_key_values is None:
@@ -11,7 +11,7 @@ def _debug_show_kvcache(past_key_values):
         break
 
 class KVCacheModelLade():
-    def __init__(self, model : torch.nn.Module, window_size = 60, guess_set_size = 60, lookahead_level = 8, topk=3) -> None:
+    def __init__(self, model : torch.nn.Module, window_size = 60, guess_set_size = 60, lookahead_level = 8, topk=3, do_sample = False) -> None:
         self._model = model
         self._past_key_values = None
         self._prob_history = None
@@ -22,6 +22,9 @@ class KVCacheModelLade():
         self.topk = topk
 
         self.ctx = None
+
+        if do_sample:
+            config_lade(LEVEL=lookahead_level, WINDOW_SIZE=window_size, GUESS_SET_SIZE=guess_set_size, POOL_FROM_PROMPT=True)
 
     @torch.no_grad()
     def generate(self, input : torch.Tensor, ngram_cache, gamma : int, **kwargs ) -> torch.Tensor:

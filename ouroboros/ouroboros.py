@@ -4,7 +4,6 @@ import torch, random, time
 from typing import List, Tuple
 from .kv_cache_model import KVCacheModelLade, KVCacheModelSimpleWithGuess
 from ouroboros.cache_engine import CacheEngine
-from ouroboros.models.modeling_llama import  config_lade
 
 @torch.no_grad()
 def evaluate_posterior(
@@ -106,7 +105,7 @@ def evaluate_posterior(
 @torch.no_grad()
 def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, ngram_cache : CacheEngine = None,
                         max_len : int = 512 , gamma : int = 4, window_size = 20, guess_set_size = 20, lookahead_level = 7,
-                        eos_token_id = 2, topk = 50, top_p = 0.6, do_sample = True, temperature=0.9) -> torch.Tensor:
+                        eos_token_id = 2, topk = 30, top_p = 0.9, do_sample = True, temperature=1) -> torch.Tensor:
     """
     Performs ouroboros with an approximate model and a target model to generate a sequence of tokens.
 
@@ -130,11 +129,6 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         ngram_cache = CacheEngine(lookahead_level, guess_set_size)
     seq_len = prefix.shape[1]
     T = seq_len + max_len
-
-    if do_sample:
-        import os
-        config_lade(LEVEL=lookahead_level, WINDOW_SIZE=window_size, GUESS_SET_SIZE=guess_set_size, POOL_FROM_PROMPT=True)
-        # lade.config_lade(LEVEL=args.level, WINDOW_SIZE=args.window, GUESS_SET_SIZE=args.guess, DEBUG=1, USE_FLASH=args.use_flash, )
     
     assert prefix.shape[0] == 1, "input batch size must be 1"
 
@@ -144,7 +138,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
 
     guess_size = lookahead_level - 1
     
-    approx_model_cache = KVCacheModelLade(approx_model, window_size=window_size, guess_set_size=guess_set_size, lookahead_level=lookahead_level)
+    approx_model_cache = KVCacheModelLade(approx_model, window_size=window_size, guess_set_size=guess_set_size, lookahead_level=lookahead_level, do_sample=do_sample)
     target_model_cache = KVCacheModelSimpleWithGuess(target_model, lookahead_level=lookahead_level)
 
     # target_model_cache = KVCacheModelSimple(target_model)
@@ -193,10 +187,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         corr_ngram = [] # ngram corrected by target_model
 
         if n < prefix_len + gen_len - 1:
-            if do_sample:
-                t = torch.multinomial(next_new_token_prob[0], 1)[None,:]
-            else:
-                t = target_model_cache._prob_history[:, n, :].argmax(dim=-1, keepdim=True)
+            t = target_model_cache._prob_history[:, n, :].argmax(dim=-1, keepdim=True)
             if t == eos_token_id:
                 end_pos = n + 2
 
@@ -216,7 +207,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
             # find the longest guess
             guess = [item for sublist in guess for item in sublist]
             guess_num = len(guess) // guess_size
-            first_tok = x[0,n].item()
+            first_tok = int(target_model_cache._prob_history[:, n, :].argmax(dim=-1))
             beg_pos = prefix_len + gen_len
             candidate = [first_tok]
             longest_can_len = 1
@@ -227,14 +218,12 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
                 real_ngram = [first_tok] + target_model_cache._prob_history[0, beg_pos + i * guess_size : beg_pos + i * guess_size + guess_size, :].argmax(dim=-1).tolist()
                 corr_ngram.append(tuple(real_ngram[:-1]))
                 pred_ngram = guess[i * guess_size : (i + 1) * guess_size]
-                tar_pros = torch.softmax(target_model_cache._prob_history[0, beg_pos + i * guess_size : beg_pos + i * guess_size + guess_size, :],dim=-1)
                 ml = 0
-                if do_sample:
-                    if first_tok != pred_ngram[0]:
-                        continue
+                if False:
+                    tar_pros = torch.softmax(target_model_cache._prob_history[0, beg_pos + i * guess_size -1: beg_pos + i * guess_size + guess_size - 1, :],dim=-1)
                     for j in range(1, guess_size):
                         ml = j
-                        tar_pro = tar_pros[i,int(pred_ngram[j])]
+                        tar_pro = tar_pros[j,int(pred_ngram[j])]
                         acp_pro = random.random()
                         if acp_pro < tar_pro:
                             if pred_ngram[j] == eos_token_id:
@@ -242,7 +231,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
                         else:
                             break
                     if ml + 1 > longest_can_len:
-                        candidate = real_ngram[:ml + 1]
+                        candidate = pred_ngram[:ml + 1]
                         longest_can_len = ml + 1
                         candidate_idx = i
                         tmp_end_pos = loc_end_pos
