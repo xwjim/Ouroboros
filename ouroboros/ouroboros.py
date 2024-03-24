@@ -105,7 +105,7 @@ def evaluate_posterior(
 @torch.no_grad()
 def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, ngram_cache : CacheEngine = None,
                         max_len : int = 512 , gamma : int = 4, window_size = 20, guess_set_size = 20, lookahead_level = 7,
-                        eos_token_id = 2, topk = 30, top_p = 0.9, do_sample = True, temperature=1) -> torch.Tensor:
+                        eos_token_id = 2, topk = 30, top_p = 0.9, do_sample = True, temperature=0.3) -> torch.Tensor:
     """
     Performs ouroboros with an approximate model and a target model to generate a sequence of tokens.
 
@@ -187,7 +187,10 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         corr_ngram = [] # ngram corrected by target_model
 
         if n < prefix_len + gen_len - 1:
-            t = target_model_cache._prob_history[:, n, :].argmax(dim=-1, keepdim=True)
+            if do_sample:
+                t = torch.multinomial(torch.softmax(target_model_cache._prob_history[0, n, :],dim=0), 1, replacement=True)[None,:]
+            else:
+                t = target_model_cache._prob_history[:, n, :].argmax(dim=-1, keepdim=True)
             if t == eos_token_id:
                 end_pos = n + 2
 
@@ -219,9 +222,9 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
                 corr_ngram.append(tuple(real_ngram[:-1]))
                 pred_ngram = guess[i * guess_size : (i + 1) * guess_size]
                 ml = 0
-                if False:
+                if do_sample:
                     tar_pros = torch.softmax(target_model_cache._prob_history[0, beg_pos + i * guess_size -1: beg_pos + i * guess_size + guess_size - 1, :],dim=-1)
-                    for j in range(1, guess_size):
+                    for j in range(guess_size):
                         ml = j
                         tar_pro = tar_pros[j,int(pred_ngram[j])]
                         acp_pro = random.random()
