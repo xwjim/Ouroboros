@@ -7,7 +7,7 @@ from ouroboros.cache_engine import CacheEngine
 
 @torch.no_grad()
 def evaluate_posterior(
-        target_logits: torch.Tensor, 
+        target_probs: torch.Tensor, 
         candidates: torch.Tensor,
         candidate_tree_index: torch.Tensor,
         draft_logits: torch.Tensor = None,
@@ -31,13 +31,13 @@ def evaluate_posterior(
     - accept_length (torch.Tensor): Length of the accepted candidate sequence (batch_size).
     """
     # Greedy decoding based on temperature value
-    candidate_logits = torch.gather(target_logits.unsqueeze(1), 2, candidate_tree_index.expand(-1,-1,-1,target_logits.shape[-1]))
-    N_batch = candidate_logits.shape[0]
-    next_new_token_prob = torch.zeros((N_batch,candidate_logits.shape[-1]), dtype=candidate_logits.dtype)
+    candidate_probs = torch.gather(target_probs.unsqueeze(1), 2, candidate_tree_index.expand(-1,-1,-1,target_probs.shape[-1]))
+    N_batch = candidate_probs.shape[0]
+    next_new_token_prob = torch.zeros((N_batch,candidate_probs.shape[-1]), dtype=candidate_probs.dtype)
     if not do_sample:
         
         posterior_mask = (
-                candidates.to(target_logits.device) == torch.argmax(candidate_logits, dim=-1)
+                candidates.to(target_probs.device) == torch.argmax(candidate_probs, dim=-1)
         ).int()
         candidates_accept_length = (torch.cumprod(posterior_mask, dim=-1)).sum(dim=-1)
         accept_length = candidates_accept_length.max(dim=1).values
@@ -47,12 +47,12 @@ def evaluate_posterior(
         best_candidate.masked_fill_(accept_length == 0 ,0)
 
         for bt in range(accept_length.shape[0]):
-            if accept_length[bt] < candidate_logits.shape[2]:
-                next_new_token_prob[bt] = torch.argmax(candidate_logits[bt,best_candidate[bt],accept_length[bt]], dim=-1)
+            if accept_length[bt] < candidate_probs.shape[2]:
+                next_new_token_prob[bt] = torch.argmax(candidate_probs[bt,best_candidate[bt],accept_length[bt]], dim=-1)
             
         return best_candidate, accept_length, next_new_token_prob
     else:
-        candidate_draft_logits = torch.gather(draft_logits.unsqueeze(1), 2, candidate_tree_index.expand(-1,-1,-1,target_logits.shape[-1]))
+        candidate_draft_logits = torch.gather(draft_logits.unsqueeze(1), 2, candidate_tree_index.expand(-1,-1,-1,target_probs.shape[-1]))
 
         best_candidate = torch.zeros((N_batch), dtype=torch.long)
         accept_length = torch.zeros((N_batch), dtype=torch.long)
@@ -74,7 +74,7 @@ def evaluate_posterior(
                     is_eq = (candidates[bt, :, :ac_length] == accept_candidate).all(dim=1)
 
                 fi = torch.nonzero(is_eq, as_tuple=True)[0].tolist()
-                tar_pro = torch.softmax(candidate_logits[bt],dim=-1)
+                tar_pro = candidate_probs[bt]
                 draft_pro = torch.softmax(candidate_draft_logits[bt],dim=-1)
 
                 for candidate_index in fi:
@@ -95,7 +95,7 @@ def evaluate_posterior(
 
             best_candidate[bt] = ac_index
             accept_length[bt] = ac_length
-            if ac_length < candidate_logits.shape[2]:
+            if ac_length < candidate_probs.shape[2]:
                 next_new_token_prob[bt] = tar_pro[ac_index,ac_length]
         return best_candidate, accept_length, next_new_token_prob
 
@@ -105,7 +105,7 @@ def evaluate_posterior(
 @torch.no_grad()
 def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, ngram_cache : CacheEngine = None,
                         max_len : int = 512 , gamma : int = 4, window_size = 20, guess_set_size = 20, lookahead_level = 7,
-                        eos_token_id = 2, topk = 30, top_p = 0.9, do_sample = True, temperature=0.3) -> torch.Tensor:
+                        eos_token_id = 2, topk = 50, top_p = 0.8, do_sample = True, temperature=0.3) -> torch.Tensor:
     """
     Performs ouroboros with an approximate model and a target model to generate a sequence of tokens.
 
@@ -139,7 +139,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
     guess_size = lookahead_level - 1
     
     approx_model_cache = KVCacheModelLade(approx_model, window_size=window_size, guess_set_size=guess_set_size, lookahead_level=lookahead_level, do_sample=do_sample)
-    target_model_cache = KVCacheModelSimpleWithGuess(target_model, lookahead_level=lookahead_level)
+    target_model_cache = KVCacheModelSimpleWithGuess(target_model, lookahead_level=lookahead_level, do_sample=do_sample)
 
     # target_model_cache = KVCacheModelSimple(target_model)
     
@@ -154,7 +154,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         prefix_len = prefix.shape[1]
 
         x, out_len, guess = approx_model_cache.generate(prefix, ngram_cache, gamma, do_sample = do_sample, temperature=temperature, top_k=topk, top_p=top_p)
-        target_model_cache._forward_with_kvcache(x, guess)
+        target_model_cache._forward_with_kvcache(x, guess, do_sample = do_sample, temperature=temperature, top_k=topk, top_p=top_p)
 
         key_tok = int(x[:,-1])
 
@@ -166,7 +166,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         # assert (torch.argmax(approx_model_cache.ctx["past_logits"][:, prefix_len-1:prefix_len-1+gen_len, :],dim=-1) == x[:, prefix_len:prefix_len+gen_len]).all()
         # print(target_model_cache._prob_history.device,approx_model_cache.ctx["past_logits"].device,device)
         best_candidate, accept_length, next_new_token_prob = evaluate_posterior(
-            target_logits = target_model_cache._prob_history[:, prefix_len-1:, :].to(device),
+            target_probs = target_model_cache._prob_history[:, prefix_len-1:, :].to(device),
             candidates = x[:, prefix_len:prefix_len+gen_len].unsqueeze(1),
             candidate_tree_index = torch.arange(gen_len)[None,None,:,None].to(device),
             draft_logits = approx_model_cache.ctx["past_logits"][:, prefix_len-1:prefix_len-1+gen_len, :].to(device),
@@ -185,21 +185,28 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
         approx_model_cache.rollback(n+1)
 
         corr_ngram = [] # ngram corrected by target_model
-
+        
         if n < prefix_len + gen_len - 1:
             if do_sample:
-                t = torch.multinomial(torch.softmax(target_model_cache._prob_history[0, n, :],dim=0), 1, replacement=True)[None,:]
+                t = torch.multinomial(target_model_cache._prob_history[0, n, :], 1)[None,:]
+                first_tok = torch.multinomial(target_model_cache._prob_history[:, prefix_len + gen_len - 1, :], 1).item()
             else:
                 t = target_model_cache._prob_history[:, n, :].argmax(dim=-1, keepdim=True)
+                first_tok = int(target_model_cache._prob_history[:, prefix_len + gen_len - 1, :].argmax(dim=-1))
+
             if t == eos_token_id:
                 end_pos = n + 2
 
-            first_tok = int(target_model_cache._prob_history[:, prefix_len + gen_len - 1, :].argmax(dim=-1))
             beg_pos = prefix_len + gen_len
-            guess_num = len(guess) // guess_size
+            guess_num = len(guess)
             for i in range(guess_num):
-                real_ngram = tuple([first_tok] + target_model_cache._prob_history[0, beg_pos + i * guess_size : beg_pos + i * guess_size + guess_size - 1, :].argmax(dim=-1).tolist())
-                corr_ngram.append(real_ngram)
+                if do_sample:
+                    real_ngram = [first_tok]
+                    for j in range(beg_pos + i * guess_size, beg_pos + i * guess_size + guess_size - 1):
+                        real_ngram.append(torch.multinomial(target_model_cache._prob_history[0, j, :], 1).item())
+                else:
+                    real_ngram = [first_tok] + target_model_cache._prob_history[0, beg_pos + i * guess_size : beg_pos + i * guess_size + guess_size - 1, :].argmax(dim=-1).tolist()
+                corr_ngram.append(tuple(real_ngram))
             if len(corr_ngram) > 0:
                 approx_model_cache.update_in_place(key_tok, corr_ngram)
 
@@ -210,7 +217,10 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
             # find the longest guess
             guess = [item for sublist in guess for item in sublist]
             guess_num = len(guess) // guess_size
-            first_tok = int(target_model_cache._prob_history[:, n, :].argmax(dim=-1))
+            if do_sample:
+                first_tok = torch.multinomial(target_model_cache._prob_history[:, n, :], num_samples=1).item()
+            else:
+                first_tok = int(target_model_cache._prob_history[:, n, :].argmax(dim=-1))
             beg_pos = prefix_len + gen_len
             candidate = [first_tok]
             longest_can_len = 1
@@ -218,27 +228,29 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
             tmp_end_pos = n + 2 if first_tok == eos_token_id else None
             loc_end_pos = None
             for i in range(guess_num):
-                real_ngram = [first_tok] + target_model_cache._prob_history[0, beg_pos + i * guess_size : beg_pos + i * guess_size + guess_size, :].argmax(dim=-1).tolist()
-                corr_ngram.append(tuple(real_ngram[:-1]))
                 pred_ngram = guess[i * guess_size : (i + 1) * guess_size]
-                ml = 0
                 if do_sample:
-                    tar_pros = torch.softmax(target_model_cache._prob_history[0, beg_pos + i * guess_size -1: beg_pos + i * guess_size + guess_size - 1, :],dim=-1)
+                    tar_pros = target_model_cache._prob_history[0, beg_pos + i * guess_size: beg_pos + i * guess_size + guess_size, :]
+                    real_ngram = [first_tok] 
+                    for j in range(guess_size):
+                        real_ngram.append(torch.multinomial(tar_pros[j], num_samples=1).item())
+                    corr_ngram.append(tuple(real_ngram[:-1]))
+                    ml = 0
                     for j in range(guess_size):
                         ml = j
-                        tar_pro = tar_pros[j,int(pred_ngram[j])]
-                        acp_pro = random.random()
-                        if acp_pro < tar_pro:
-                            if pred_ngram[j] == eos_token_id:
-                                loc_end_pos = j
-                        else:
+                        if real_ngram[j] == eos_token_id:
+                            loc_end_pos = j
+                        if real_ngram[j] != pred_ngram[j]:
                             break
                     if ml + 1 > longest_can_len:
-                        candidate = pred_ngram[:ml + 1]
+                        candidate = real_ngram[:ml + 1]
                         longest_can_len = ml + 1
                         candidate_idx = i
                         tmp_end_pos = loc_end_pos
                 else:
+                    real_ngram = [first_tok] + target_model_cache._prob_history[0, beg_pos + i * guess_size : beg_pos + i * guess_size + guess_size, :].argmax(dim=-1).tolist()
+                    corr_ngram.append(tuple(real_ngram[:-1]))
+                    ml = 0
                     for j in range(guess_size):
                         ml = j
                         if real_ngram[j] == eos_token_id:

@@ -1,6 +1,7 @@
 import torch
 from typing import Optional
 from ouroboros.models.modeling_llama import  config_lade
+from ouroboros.models.utils import norm_logits
 
 def _debug_show_kvcache(past_key_values):
     if  past_key_values is None:
@@ -20,6 +21,7 @@ class KVCacheModelLade():
         self.guess_set_size = guess_set_size
         self.lookahead_level = lookahead_level
         self.topk = topk
+        self.do_sample = do_sample
 
         self.ctx = None
 
@@ -61,17 +63,18 @@ class KVCacheModelLade():
 
 
 class KVCacheModelSimpleWithGuess():
-    def __init__(self, model : torch.nn.Module, lookahead_level=8, debug=False) -> None:
+    def __init__(self, model : torch.nn.Module, lookahead_level=8, debug=False, do_sample=False) -> None:
         self._model = model
         self._past_key_values = None
         self._prob_history = None
+        self.do_sample = do_sample
 
         self.debug = debug
         self.idx = 0
         self.guess_size = lookahead_level - 1
 
     @torch.no_grad()
-    def _forward_with_kvcache(self, input_ids : torch.Tensor, guess, use_debug = False) -> torch.Tensor:
+    def _forward_with_kvcache(self, input_ids : torch.Tensor, guess, use_debug = False, **kwargs) -> torch.Tensor:
         input_len = input_ids.shape[-1]
         position_ids = torch.cat([torch.arange(self.idx, input_len, device=input_ids.device)] + [torch.arange(input_len, input_len + self.guess_size, device=input_ids.device)] * len(guess)).unsqueeze(0)     
         if self._past_key_values is None:
@@ -82,7 +85,10 @@ class KVCacheModelSimpleWithGuess():
 
             
             outputs = self._model.forward_with_guess(input_ids, guess_len = len(guess[0]), guess_size=self.guess_size, position_ids=position_ids)
-            self._prob_history = outputs.logits
+            if self.do_sample:
+                self._prob_history = norm_logits(outputs.logits.squeeze(0), kwargs["temperature"], kwargs["top_k"], kwargs["top_p"]).unsqueeze(0)
+            else:
+                self._prob_history = torch.softmax(outputs.logits.squeeze(0),dim=-1)
             self._past_key_values = outputs.past_key_values
 
             if self.debug:
@@ -105,7 +111,10 @@ class KVCacheModelSimpleWithGuess():
                 _debug_show_kvcache(self._past_key_values)
             outputs = self._model.forward_with_guess(last_input_id, past_key_values=self._past_key_values, use_cache=True, guess_len = len(guess[0]), guess_size=self.guess_size, position_ids=position_ids)
             
-            not_cached_q = outputs.logits
+            if self.do_sample:
+                not_cached_q = norm_logits(outputs.logits.squeeze(0), kwargs["temperature"], kwargs["top_k"], kwargs["top_p"]).unsqueeze(0)
+            else:
+                not_cached_q = torch.softmax(outputs.logits.squeeze(0),dim=-1)
             if not_cached_q.dim() == 2:
                 not_cached_q = torch.unsqueeze(not_cached_q, 0)
                   

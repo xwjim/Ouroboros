@@ -2206,7 +2206,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                             if sample_prob < prob_accept:
                                 #accept
                                 hits.append(draft_guess)
-                                next_tokens = torch.tensor(draft_guess,dtype=torch.long,device=guess_probs.device)
+                                next_tokens = torch.tensor(int(draft_guess),dtype=torch.long,device=guess_probs.device)
                                 is_accept = True 
                                 max_hit_idx = guess_idx
                                 new_guess_indices = []
