@@ -50,8 +50,6 @@ from transformers.utils import is_flash_attn_2_available
 import copy, inspect
 import warnings
 
-from ouroboros.cache_engine import CacheEngine
-
 CONFIG_MAP = {}
 COLOR_PRINT = int(os.environ.get("COLOR_PRINT", 0))
 
@@ -2069,12 +2067,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             # past_tokens = [[set_token() for _ in range(WINDOW_SIZE + LEVEL - 3)]] + [None for _ in range(LEVEL - 2)]
             fill_level = continue_ctx['fill_level'] 
             ngram_cache = continue_ctx['ngram_cache']
-            token_map = ngram_cache.token_map
             lst_token = int(input_ids[:,-1])
         else:
-            token_map = {}
             if POOL_FROM_PROMPT:
-                fill_pool_with_prompt(all_old_tokens, token_map, LEVEL, GUESS_SET_SIZE)
+                fill_pool_with_prompt(all_old_tokens, ngram_cache.token_map, LEVEL, GUESS_SET_SIZE)
             ngram_cache = ngram_cache
             past_logits = None
 
@@ -2096,8 +2092,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-            if past_tokens[LEVEL - 2] is not None and lst_token in token_map and GUESS_SET_SIZE > 0:  
-                guess_tokens_ = token_map[lst_token]
+            if past_tokens[LEVEL - 2] is not None and ngram_cache.has(lst_token) and GUESS_SET_SIZE > 0:  
+                guess_tokens_ = ngram_cache.get_guess_tokens(lst_token)
                 guess_tokens = []
                 for tok in list(guess_tokens_):
                     guess_tokens += list(tok)
@@ -2248,7 +2244,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 
                 assert len(past_tokens[LEVEL - 2]) == WINDOW_SIZE and len(new_results) == WINDOW_SIZE
 
-                update_token_map(token_map, lst_token, past_tokens, new_results, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE)
+                ngram_cache.insert(lst_token, new_results, past_tokens, GUESS_SET_SIZE, LEVEL, WINDOW_SIZE)
 
                 #update windows when max_hit > 1
                 if ALWAYS_FWD_ONE:
@@ -2303,8 +2299,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                     break
                 else:
                     all_old_tokens.append(hits[hit_ids])
-                    if POOL_FROM_PROMPT:
-                        append_new_generated_pool(all_old_tokens[-LEVEL:], token_map, LEVEL, GUESS_SET_SIZE)
 
             if chat:
 
@@ -2334,7 +2328,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             continue_ctx["past_logits"] =  past_logits
             continue_ctx['fill_level'] = fill_level
             continue_ctx['cur_input_ids'] = input_ids
-            continue_ctx['ngram_cache'] = CacheEngine(LEVEL,GUESS_SET_SIZE,token_map=token_map)
+            continue_ctx['ngram_cache'] = ngram_cache
             self.ctx = continue_ctx
 
             ###not change codes below
