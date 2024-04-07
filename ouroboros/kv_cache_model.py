@@ -26,7 +26,7 @@ class KVCacheModelLade():
         self.ctx = None
 
         if do_sample:
-            config_lade(LEVEL=lookahead_level, WINDOW_SIZE=window_size, GUESS_SET_SIZE=guess_set_size, POOL_FROM_PROMPT=True)
+            config_lade(LEVEL=lookahead_level, WINDOW_SIZE=window_size, GUESS_SET_SIZE=guess_set_size, POOL_FROM_PROMPT=True, USE_FLASH=False)
 
     @torch.no_grad()
     def generate(self, input : torch.Tensor, ngram_cache, gamma : int, **kwargs ) -> torch.Tensor:

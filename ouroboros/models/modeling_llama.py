@@ -83,6 +83,13 @@ if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
+try:
+    from flash_attn_lade import flash_attn_func
+    flash_attn_lookahead_available = True
+
+except:
+    flash_attn_lookahead_available = False
+
 from .mask_making_llama import j_make_causal_mask_with_guess, j_make_causal_mask_multilevel
 
 
@@ -365,6 +372,7 @@ class LlamaAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         padding_mask: Optional[torch.LongTensor] = None,
+        lookahead: List = [0, 0, 0, 0, 0, 0, 0] # This is not useful
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -635,6 +643,7 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self._flash_attn_2_enabled = config._attn_implementation == "flash_attention_2"
         self.self_attn = (
             LlamaAttention(config=config)
             if not getattr(config, "_flash_attn_2_enabled", False)
@@ -652,6 +661,9 @@ class LlamaDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        lookahead: List=[0,0,0,0,0,0,0],
+        use_flash: bool = False,
+        is_prefill: bool = False,
         padding_mask: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -667,21 +679,34 @@ class LlamaDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
-
+        if use_flash:
+            assert isinstance(self.self_attn, LlamaFlashAttention2)
+            
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            padding_mask=padding_mask,
-        )
+        if not use_flash and not self._flash_attn_2_enabled:
+            hidden_states, self_attn_weights, present_key_value = self.self_attn.forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                lookahead=None,
+            )
+        else:
+            hidden_states, self_attn_weights, present_key_value = self.self_attn.forward_flash(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                lookahead=lookahead,
+            )
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -1216,6 +1241,7 @@ class LlamaModel(LlamaPreTrainedModel):
         continue_all: bool=False,
         guess: Optional[torch.Tensor] = None,
         extra_input_length: int =0,
+        use_flash : bool =False,
         debug = False,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         
@@ -1267,9 +1293,17 @@ class LlamaModel(LlamaPreTrainedModel):
             else:
                 padding_mask = None
 
-        attention_mask = self.j_prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length, (WINDOWS_SIZE, is_prefill, guess, guess_size, not_seq, continue_all, level_sizes, extra_input_length), 
-        )
+        if use_flash:
+            attention_mask = None
+        else:
+            attention_mask = self.j_prepare_decoder_attention_mask(
+                attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length, (WINDOWS_SIZE, is_prefill, guess, guess_size, not_seq, continue_all, level_sizes, extra_input_length), 
+            )
+
+        level_offset = seq_length - (sum(level_sizes) + 1) - (len(guess) if guess is not None else 0) #offset when you guess multiple tokens and not copy kv-cache 
+        dist_offset = (1 + level_sizes[0] - level_sizes[-1]) #offset for distributed inference 
+
+        lookahead = [level_sizes[-1], len(level_sizes) + 1, len(guess) // guess_size if guess is not None else 0,0,level_offset+dist_offset,level_offset,0]
 
         hidden_states = inputs_embeds
 
@@ -1312,6 +1346,9 @@ class LlamaModel(LlamaPreTrainedModel):
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     padding_mask=padding_mask,
+                    use_flash = use_flash,
+                    lookahead = lookahead,
+                    is_prefill = is_prefill,
                 )
 
             hidden_states = layer_outputs[0]
