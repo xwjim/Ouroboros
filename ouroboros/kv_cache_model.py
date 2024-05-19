@@ -2,6 +2,16 @@ import torch
 from typing import Optional
 from ouroboros.models.modeling_llama import  config_lade
 from ouroboros.models.utils import norm_logits
+import random
+
+from ouroboros.models.cllm.utils import detect_repetitive_patterns
+from ouroboros.models.cllm.cllm_llama_modeling import delete_false_key_value, jacobi_forward_profiling
+from transformers.cache_utils import Cache, DynamicCache
+from ouroboros.cache_engine import CacheEngine
+from transformers import LlamaModel, LlamaForCausalLM, GenerationConfig
+
+DynamicCache.delete_false_key_value = delete_false_key_value
+LlamaForCausalLM.jacobi_forward = jacobi_forward_profiling
 
 def _debug_show_kvcache(past_key_values):
     if  past_key_values is None:
@@ -11,8 +21,75 @@ def _debug_show_kvcache(past_key_values):
         print(f"kv cache: k shape {k.shape}, v shape {v.shape}")
         break
 
+class KVCacheModelCLLM():
+
+    def __init__(self, model : torch.nn.Module, window_size = 60, guess_set_size = 60, lookahead_level = 8, topk=3, do_sample = True) -> None:
+        self._model = model
+        self._prob_history = None
+
+        self.window_size = window_size
+        self.guess_set_size = guess_set_size
+        self.lookahead_level = lookahead_level
+        self.topk = topk
+        self.do_sample = do_sample
+
+        self.ctx = {}
+        self.ctx["ngram_cache"] = CacheEngine(self.lookahead_level, self.guess_set_size)
+        self.ctx['past_key_values'] = None
+
+    @torch.no_grad()
+    def generate(self, inputs : torch.Tensor, **kwargs ) -> torch.Tensor:
+
+        if self.ctx['past_key_values'] is None:
+            self.ctx['past_key_values'], self.first_correct_token, self.ctx["past_logits"] = self._model.jacobi_forward(input_ids=inputs, max_new_tokens=self.lookahead_level, past_key_values=None, use_cache = True, prefill_phase = True)
+
+        generation = inputs
+        N_new = self.first_correct_token.shape[-1]
+        ### generation phase
+        # randomly initialize the first point of jacobian trajectory
+        random_point = torch.tensor(random.choices(generation[0], k=(self.lookahead_level - N_new))).to(generation.device).view(1,-1)
+        input_ids = torch.cat((self.first_correct_token.view(1,-1), random_point),dim=-1)
+
+        jacobian_trajectory, n_gram_generation, self.first_correct_token, iter_steps, self.ctx["past_logits"] = self._model.jacobi_forward(input_ids=input_ids, max_new_tokens=self.lookahead_level, past_key_values=self.ctx['past_key_values'], use_cache = True, prefill_phase = False)
+
+
+        if n_gram_generation[0,0].item() not in self.ctx['ngram_cache'].token_map:
+            self.ctx['ngram_cache'].token_map[n_gram_generation[0,0].item()] = []
+        self.ctx['ngram_cache'].token_map[n_gram_generation[0,0].item()].append(tuple(n_gram_generation[0,1:].tolist()) + (self.first_correct_token.item(),))
+        
+        ### see if next max_new_tokens should be generated & if True, update weights and prepare new input_id 
+        generation = torch.cat((generation, n_gram_generation), dim=-1)
+
+        lst_token = generation[0,-1]
+
+        tups = []
+        # if self.ctx['ngram_cache'].has(lst_token):
+        #     # tup = self.ctx['ngram_cache'].get_guess_tokens(lst_token)[-1] # get the newest ngram
+        #     # output = torch.cat([output, torch.tensor([tup], device=output.device)], dim=-1)
+        #     tups = self.ctx['ngram_cache'].get_guess_tokens(lst_token)[-self.topk:] # TODO
+
+        return generation, generation.shape[1], tups
+    
+    @torch.no_grad()
+    def rollback(self, end_pos : int):
+        cache = []
+        for i in range(len(self.ctx['past_key_values'])):
+            k = self.ctx['past_key_values'][i][0][:,:,:end_pos,:]
+            v = self.ctx['past_key_values'][i][1][:,:,:end_pos,:]
+            cache.append((k, v))
+        self.ctx['past_key_values'] = self.ctx['past_key_values'].from_legacy_cache(cache)
+        self.ctx["past_logits"] = self.ctx["past_logits"][:,:end_pos,:]
+    
+    def update_ngram_cache(self, remaining_approx_tok: torch.tensor, remaining_target_tok: torch.tensor):
+        assert remaining_approx_tok.shape[-1] == remaining_target_tok.shape[-1]
+        self.ctx['ngram_cache'].add_extra_ngram(remaining_approx_tok, remaining_target_tok)
+    
+    def update_in_place(self, key_token: int, modified_ngrams: list):
+        # modified_ngrams should be like: [[1,2,3,4,5,6], [1,3,4,5,6,7]] and should not be empty
+        self.ctx['ngram_cache'].update_in_place(key_token, modified_ngrams)
+
 class KVCacheModelLade():
-    def __init__(self, model : torch.nn.Module, window_size = 60, guess_set_size = 60, lookahead_level = 8, topk=3, do_sample = False) -> None:
+    def __init__(self, model : torch.nn.Module, window_size = 60, guess_set_size = 60, lookahead_level = 8, topk=3, do_sample = True) -> None:
         self._model = model
         self._past_key_values = None
         self._prob_history = None
@@ -36,10 +113,10 @@ class KVCacheModelLade():
         lst_token = int(output[0, -1])
         out_len = output.shape[-1]
         tups = []
-        if self.ctx['ngram_cache'].has(lst_token):
-            # tup = self.ctx['ngram_cache'].get_guess_tokens(lst_token)[-1] # get the newest ngram
-            # output = torch.cat([output, torch.tensor([tup], device=output.device)], dim=-1)
-            tups = self.ctx['ngram_cache'].get_guess_tokens(lst_token)[-self.topk:] # TODO
+        # if self.ctx['ngram_cache'].has(lst_token):
+        #     # tup = self.ctx['ngram_cache'].get_guess_tokens(lst_token)[-1] # get the newest ngram
+        #     # output = torch.cat([output, torch.tensor([tup], device=output.device)], dim=-1)
+        #     tups = self.ctx['ngram_cache'].get_guess_tokens(lst_token)[-self.topk:] # TODO
 
         return output, out_len, tups
     
@@ -88,7 +165,7 @@ class KVCacheModelSimpleWithGuess():
             if self.do_sample:
                 self._prob_history = norm_logits(outputs.logits.squeeze(0), kwargs["temperature"], kwargs["top_k"], kwargs["top_p"]).unsqueeze(0)
             else:
-                self._prob_history = torch.softmax(outputs.logits.squeeze(0),dim=-1)
+                self._prob_history = torch.softmax(outputs.logits.squeeze(0),dim=-1).unsqueeze(0)
             self._past_key_values = outputs.past_key_values
 
             if self.debug:

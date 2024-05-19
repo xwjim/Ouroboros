@@ -2,7 +2,7 @@ import torch
 from tqdm import tqdm
 import torch, random, time
 from typing import List, Tuple
-from .kv_cache_model import KVCacheModelLade, KVCacheModelSimpleWithGuess
+from .kv_cache_model import KVCacheModelLade, KVCacheModelSimpleWithGuess, KVCacheModelCLLM
 from ouroboros.cache_engine import CacheEngine
 
 @torch.no_grad()
@@ -105,7 +105,7 @@ def evaluate_posterior(
 @torch.no_grad()
 def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, ngram_cache : CacheEngine = None,
                         max_len : int = 512 , gamma : int = 4, window_size = 20, guess_set_size = 20, lookahead_level = 7,
-                        eos_token_id = 2, topk = 50, top_p = 0.8, do_sample = True, temperature=0.3) -> torch.Tensor:
+                        eos_token_id = 2, topk = 50, top_p = 0.8, do_sample = False, temperature=0.3) -> torch.Tensor:
     """
     Performs ouroboros with an approximate model and a target model to generate a sequence of tokens.
 
@@ -133,12 +133,13 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
     assert prefix.shape[0] == 1, "input batch size must be 1"
 
     assert approx_model.device == target_model.device
+    assert prefix.device == target_model.device
     
     device = target_model.device
 
     guess_size = lookahead_level - 1
     
-    approx_model_cache = KVCacheModelLade(approx_model, window_size=window_size, guess_set_size=guess_set_size, lookahead_level=lookahead_level, do_sample=do_sample)
+    approx_model_cache = KVCacheModelCLLM(approx_model, window_size=window_size, guess_set_size=guess_set_size, lookahead_level=lookahead_level, do_sample=do_sample)
     target_model_cache = KVCacheModelSimpleWithGuess(target_model, lookahead_level=lookahead_level, do_sample=do_sample)
 
     # target_model_cache = KVCacheModelSimple(target_model)
@@ -152,8 +153,7 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
     while prefix.shape[1] < T:
         # q = M_q[prefix + x_0, x_1, .., x_(gamma-2)]
         prefix_len = prefix.shape[1]
-
-        x, out_len, guess = approx_model_cache.generate(prefix, ngram_cache, gamma, do_sample = do_sample, temperature=temperature, top_k=topk, top_p=top_p)
+        x, out_len, guess = approx_model_cache.generate(prefix, do_sample = do_sample, temperature=temperature, top_k=topk, top_p=top_p)
         target_model_cache._forward_with_kvcache(x, guess, do_sample = do_sample, temperature=temperature, top_k=topk, top_p=top_p)
 
         key_tok = int(x[:,-1])
@@ -172,13 +172,16 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
             draft_logits = approx_model_cache.ctx["past_logits"][:, prefix_len-1:prefix_len-1+gen_len, :].to(device),
             do_sample = do_sample,
         )
-
+        # print("accept_length", accept_length)
         accept_length = accept_length.item()
         accepted_count += accept_length
         n = prefix_len + accept_length - 1
+        # accept_length = gen_len
+        new_generation = x[:, prefix_len: prefix_len+accept_length]
+        eos_positions = torch.where(new_generation[0]==eos_token_id)[0]
 
-        if accept_length != 0 and x[:,prefix_len+accept_length-1] == eos_token_id:
-            end_pos = prefix_len + accept_length
+        if len(eos_positions) > 0:
+            end_pos = prefix_len + eos_positions.item()
 
         prefix = x[:, :n + 1]
 
@@ -212,7 +215,8 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
 
 
             target_model_cache.rollback(n+1)
-            prefix = torch.cat((prefix, t.to(prefix.device)), dim=1)
+            approx_model_cache.first_correct_token = t.to(prefix.device)
+            # prefix = torch.cat((prefix, t.to(prefix.device)), dim=1)
         else:
             # find the longest guess
             guess = [item for sublist in guess for item in sublist]
@@ -265,7 +269,8 @@ def ouroboros(prefix : torch.Tensor, approx_model : torch.nn.Module, target_mode
             if tmp_end_pos is not None:
                 end_pos = beg_pos + candidate_idx * guess_size + tmp_end_pos + 1
             candidate = torch.tensor([candidate], device=prefix.device)
-            prefix = torch.cat((prefix, candidate), dim=1)
+            # prefix = torch.cat((prefix, candidate), dim=1)
+            approx_model_cache.first_correct_token = candidate
             if len(corr_ngram) > 0:
                 approx_model_cache.update_in_place(key_tok, corr_ngram)
             if candidate_idx != -1:
